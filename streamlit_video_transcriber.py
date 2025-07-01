@@ -19,7 +19,7 @@ import os
 load_dotenv()  # take environment variables from .env
 openai.api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("openai_key")
 
-MODEL = whisper.load_model("large")
+MODEL = whisper.load_model("medium")
 
 # === SESSION STATE ===
 if "question_texts" not in st.session_state:
