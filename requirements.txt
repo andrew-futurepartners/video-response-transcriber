@@ -4,4 +4,4 @@ pandas
 ffmpeg-python
 imageio-ffmpeg
 python-dotenv
-whisper @ git+https://github.com/openai/whisper.git
+openai-whisper @ git+https://github.com/openai/whisper.git
