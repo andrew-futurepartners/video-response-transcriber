@@ -17,7 +17,7 @@ st.title("🎥 Survey Video Response Transcriber")
 from dotenv import load_dotenv
 import os
 load_dotenv()  # take environment variables from .env
-openai.api_key = os.getenv("OPENAI_API_KEY")
+openai.api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("openai_key")
 
 MODEL = whisper.load_model("large")
 
