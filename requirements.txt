@@ -5,3 +5,4 @@ ffmpeg-python
 imageio-ffmpeg
 python-dotenv
 openai-whisper @ git+https://github.com/openai/whisper.git
+tqdm
