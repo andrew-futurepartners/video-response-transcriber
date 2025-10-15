@@ -77,38 +77,124 @@ def unzip_all_folders(root_dir):
         if item.endswith('.zip') and os.path.isfile(item_path):
             unzip_folder(item_path, root_dir)
 
-# 4) map each question_label -> full question text
-QUESTION_TEXT_MAP = {
-    "qOneThingEE": "What is the one thing Las Vegas has that sets it apart from other vacation destinations?",
-    "qFriendEE": "If a friend asked you “is Las Vegas worth it?”, what would you say — and why? Please be specific and describe any activities, attractions, experiences or vibes you would mention to them, as well as any comparisons you might make to other destinations.",
-    "qPosSurpriseEE": "What has been the most pleasantly surprising part of your Vegas trip so far? What will you tell your friends or family about it when you get home?",
-    "qNegSurpriseEE": "What has been the most unfortunately frustrating part of your Vegas trip so far? What will you tell your friends or family about it when you get home?",
-    "qFeesCurrentEE": "Have there been any costs or charges you hadn’t anticipated on this trip? How have you encountered them, how are they affecting your impression of Las Vegas overall, and how do they compare to other destinations you have recently visited?",
-    "qMemoryEE": "What is the strongest memory you have about your most recent visit to Las Vegas, and how does this memory make you feel when you recall it?",
-    "qFeesRecentEE": "On your most recent trip to Las Vegas, were there any costs or charges you hadn’t anticipated? How did you encounter them, how did they affect your impression of Las Vegas overall, and how do they compare to other destinations you have recently visited?",
-    "qInspireEE": "Think about planning your next vacation – what might inspire you to return to Las Vegas? A fond memory or feeling, the people and atmosphere, a certain experience, a great deal, or something else?",
-    "qMissingEE": "Is there something you feel is missing from the Las Vegas experience that has kept you from visiting yet? Please fill in the blank in your response: “If Las Vegas had _________, I would consider booking a trip right now.”"
-}
-# 5) helper functions for processing different submission types
-def get_submission_type_from_folder(folder_name):
-    """Extract submission type (_TXT, _AUD, _VID) from folder name"""
-    if '_AUD_' in folder_name:
-        return 'AUD'
-    elif '_VID_' in folder_name:
-        return 'VID'
-    elif '_TXT_' in folder_name:
-        return 'TXT'
-    return None
+"""
+4) Dynamic question text mapping utilities
+We build question text dynamically from the survey's Datamap sheet.
+Also provide robust folder parsing to detect survey_id, base_question, submission type.
+"""
 
-def get_base_question_from_folder(folder_name):
-    """Extract base question name from folder name (e.g., qOneThingEE from qOneThingEE_AUD)"""
-    if '_AUD_' in folder_name:
-        return folder_name.split('_AUD_')[0].split('_')[-1]  # Get the question part
-    elif '_VID_' in folder_name:
-        return folder_name.split('_VID_')[0].split('_')[-1]  # Get the question part
-    elif '_TXT_' in folder_name:
-        return folder_name.split('_TXT_')[0].split('_')[-1]  # Get the question part
-    return folder_name
+# Global caches per survey to avoid repeated IO
+SURVEY_TO_QMAP = {}
+SURVEY_TO_DATAFILE = {}
+SURVEY_TO_BASES = {}
+
+_FOLDER_REGEX = re.compile(r".*_(?P<survey_id>\d{6})_(?P<qbase>q[^_]+)_(?P<stype>AUD|VID|TXT)_media_testimonials$")
+
+def parse_media_folder_name(folder_name):
+    """Return (survey_id, base_question, submission_type) or (None, None, None) if not matched."""
+    m = _FOLDER_REGEX.match(folder_name)
+    if not m:
+        return None, None, None
+    survey_id = m.group("survey_id")
+    base_question = m.group("qbase")
+    submission_type = m.group("stype")
+    return survey_id, base_question, submission_type
+
+def find_data_file_for_survey(survey_id, root_dir="data files"):
+    """
+    Locate the survey's primary Excel file.
+    Preference order:
+      1) data files/<survey_id>/<survey_id>.xlsx
+      2) Any .xlsx under root that includes <survey_id> (excluding temp and _Transcribed)
+    """
+    preferred = os.path.join(root_dir, survey_id, f"{survey_id}.xlsx")
+    if os.path.exists(preferred):
+        return preferred
+
+    candidates = []
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            if not file.endswith('.xlsx'):
+                continue
+            if file.startswith('~') or file.endswith('_Transcribed.xlsx'):
+                continue
+            path = os.path.join(root, file)
+            if survey_id in path:
+                candidates.append(path)
+
+    if not candidates:
+        return None
+
+    # Prefer any candidate within a folder named <survey_id>
+    for path in candidates:
+        parts = os.path.normpath(path).split(os.sep)
+        if survey_id in parts:
+            return path
+    # Fallback to first candidate
+    return candidates[0]
+
+def build_question_text_map_from_datamap(xlsx_path):
+    """
+    Parse the Datamap sheet (or fall back to second sheet) to build a map from
+    base question (e.g., qFeesRecentEE) -> question text.
+    We extract only tags ending with _TXT: "[qBase_TXT]: question text...".
+    """
+    qmap = {}
+    try:
+        try:
+            df_dm = pd.read_excel(xlsx_path, sheet_name="Datamap", header=None, usecols=[0])
+        except Exception:
+            df_dm = pd.read_excel(xlsx_path, sheet_name=1, header=None, usecols=[0])
+
+        tag_regex = re.compile(r"^\[(?P<tag>[^\]]+)\]:\s*(?P<text>.+)$")
+        for val in df_dm.iloc[:, 0].dropna().astype(str):
+            m = tag_regex.match(val.strip())
+            if not m:
+                continue
+            tag = m.group("tag").strip()
+            text = m.group("text").strip()
+            if tag.endswith("_TXT") and text:
+                base = tag[:-4]  # remove _TXT
+                qmap[base] = text
+    except Exception as e:
+        print(f"❌ Error parsing Datamap in {os.path.basename(xlsx_path)}: {e}")
+    return qmap
+
+def validate_question_columns(xlsx_path, base_question):
+    """Return True if base TXT or AUD/VID c1 columns exist in the first sheet."""
+    try:
+        df0 = pd.read_excel(xlsx_path, sheet_name=0)
+        cols = set(str(c) for c in df0.columns)
+        if f"{base_question}_TXT" in cols:
+            return True
+        if f"{base_question}_AUDc1" in cols or f"{base_question}_VIDc1" in cols:
+            return True
+        return False
+    except Exception as e:
+        print(f"❌ Error validating columns in {os.path.basename(xlsx_path)}: {e}")
+        return False
+
+def get_question_text(survey_id, base_question):
+    """Fetch the dynamic question text for a survey/base question, or None if unavailable."""
+    qmap = SURVEY_TO_QMAP.get(survey_id, {})
+    return qmap.get(base_question)
+
+def discover_base_questions_in_datafile(xlsx_path):
+    """Discover base question tags by scanning sheet 0 columns for *_TXT, *_AUDc1, *_VIDc1."""
+    bases = set()
+    try:
+        df0 = pd.read_excel(xlsx_path, sheet_name=0)
+        for col in df0.columns:
+            col_str = str(col)
+            if col_str.endswith('_TXT'):
+                bases.add(col_str[:-4])
+            elif col_str.endswith('_AUDc1'):
+                bases.add(col_str[:-6])
+            elif col_str.endswith('_VIDc1'):
+                bases.add(col_str[:-6])
+    except Exception as e:
+        print(f"❌ Error discovering questions in {os.path.basename(xlsx_path)}: {e}")
+    return sorted(bases)
 
 def transcribe_media_file(file_path, model):
     """Transcribe audio or video file using Whisper"""
@@ -188,28 +274,38 @@ for folder in os.listdir(VIDEOS_ROOT):
     if not os.path.isdir(folder_path):
         continue
     
-    # Extract submission type and base question
-    submission_type = get_submission_type_from_folder(folder)
-    if not submission_type:
-        print(f"🔶 Skipping folder without submission type: {folder}")
+    # Extract survey_id, base_question, submission_type via regex
+    survey_id, base_question, submission_type = parse_media_folder_name(folder)
+    if not survey_id or not base_question or not submission_type:
+        print(f"🔶 Skipping folder with unexpected naming: {folder}")
         continue
-    
-    base_question = get_base_question_from_folder(folder)
-    if base_question not in QUESTION_TEXT_MAP:
-        print(f"🔶 No question mapping for '{base_question}', skipping.")
-        continue
-    
-    # Extract survey_id from folder name
-    # Format: selfserve.decipherinc.com_selfserve_38ba_250904_qFeesUpdatedEE_AUD_media_testimonials
-    # The survey ID is the 4th element (index 3) when split by underscore
-    parts = folder.split("_")
-    if len(parts) < 5:
-        print(f"🔶 Unexpected folder format: {folder}")
-        continue
-    
-    survey_id = parts[3]  # Fourth element is the survey ID (e.g., 250904)
     
     print(f"   - Extracted survey_id: {survey_id}")
+    
+    # Ensure data file and question map are loaded for this survey
+    if survey_id not in SURVEY_TO_DATAFILE:
+        data_file_path = find_data_file_for_survey(survey_id, DATA_FILES_ROOT)
+        SURVEY_TO_DATAFILE[survey_id] = data_file_path
+        if not data_file_path:
+            print(f"⚠️ No data file found for survey {survey_id}; proceeding without question text.")
+        else:
+            SURVEY_TO_QMAP[survey_id] = build_question_text_map_from_datamap(data_file_path)
+            SURVEY_TO_BASES[survey_id] = discover_base_questions_in_datafile(data_file_path)
+            print(f"   - Built question map with {len(SURVEY_TO_QMAP[survey_id])} entries for survey {survey_id}")
+            print(f"   - Discovered {len(SURVEY_TO_BASES[survey_id])} base questions in data file")
+            # Print Datamap summary of question IDs and texts
+            if SURVEY_TO_QMAP[survey_id]:
+                try:
+                    pairs = [f"{k}: {v}" for k, v in SURVEY_TO_QMAP[survey_id].items()]
+                    joined = ", ".join(pairs)
+                    print(f"📘 Datamap summary for {os.path.basename(data_file_path)} -> {joined}")
+                except Exception as e:
+                    print(f"⚠️ Could not print Datamap summary: {e}")
+    
+    # Validate that base_question columns exist in data file (best-effort)
+    data_file_for_validation = SURVEY_TO_DATAFILE.get(survey_id)
+    if data_file_for_validation and not validate_question_columns(data_file_for_validation, base_question):
+        print(f"🔶 Validation warning: '{base_question}' columns not found in data file for survey {survey_id}")
     
     # Initialize structure if needed
     if base_question not in submissions_by_question:
@@ -271,9 +367,15 @@ for folder in os.listdir(VIDEOS_ROOT):
             # Transcribe audio/video
             transcript = transcribe_media_file(media_path, model)
             if transcript != "[NO AUDIO]":
-                # Score with GPT
-                question_text = QUESTION_TEXT_MAP[base_question]
-                clean_transcript, score, flag = score_transcript_with_gpt(transcript, question_text, client)
+                # Score with GPT using dynamic question text, or skip scoring if missing
+                question_text = get_question_text(survey_id, base_question)
+                if not question_text:
+                    clean_transcript = transcript
+                    score = 0
+                    flag = "no"
+                    print(f"🔶 Missing question text for {base_question} (survey {survey_id}); skipping scoring")
+                else:
+                    clean_transcript, score, flag = score_transcript_with_gpt(transcript, question_text, client)
             else:
                 clean_transcript, score, flag = transcript, 0, "yes"
         else:
@@ -290,66 +392,55 @@ for folder in os.listdir(VIDEOS_ROOT):
             'path': media_path
         })
 
-# 9) process data files to get text submissions
+# 9) process data files to get text submissions (row-based TXT)
 print("\n📄 Processing text submissions from data files...")
 text_submissions_found = 0
 
-# Look for Excel files in both root and nested directories
-excel_files = []
-for root, dirs, files in os.walk(DATA_FILES_ROOT):
-    for file in files:
-        if file.endswith('.xlsx') and not file.startswith('~'):
-            excel_files.append(os.path.join(root, file))
-
+# Use discovered data files per survey from earlier pass
+excel_files = list(set([p for p in SURVEY_TO_DATAFILE.values() if p]))
 print(f"   - Found {len(excel_files)} Excel files to process")
 for excel_file in excel_files:
     print(f"     * {excel_file}")
 
 for excel_path in excel_files:
-    # Extract survey_id from the Excel file path
-    if excel_path.endswith('_Transcribed.xlsx'):
-        survey_id = os.path.basename(excel_path).replace('_Transcribed.xlsx', '')
-    else:
-        survey_id = os.path.basename(excel_path).replace('.xlsx', '')
-    
+    survey_id = os.path.basename(excel_path).replace('.xlsx', '')
+    if survey_id.endswith('_Transcribed'):
+        survey_id = survey_id.replace('_Transcribed', '')
     print(f"📊 Processing data file: {os.path.basename(excel_path)}")
     
     try:
-        df = pd.read_excel(excel_path)
+        df = pd.read_excel(excel_path, sheet_name=0)
         print(f"   - Data file has {len(df)} rows and {len(df.columns)} columns")
         
         # Look for text submission columns
-        txt_columns = [col for col in df.columns if col.endswith('_TXT')]
+        txt_columns = [col for col in df.columns if str(col).endswith('_TXT')]
         print(f"   - Found {len(txt_columns)} TXT columns: {txt_columns}")
         
         for col in txt_columns:
-            base_question = col.replace('_TXT', '')
+            base_question = str(col).replace('_TXT', '')
             print(f"   - Processing column: {col} (question: {base_question})")
             
-            if base_question in QUESTION_TEXT_MAP:
-                # Initialize if needed
-                if base_question not in submissions_by_question:
-                    submissions_by_question[base_question] = {}
-                if survey_id not in submissions_by_question[base_question]:
-                    submissions_by_question[base_question][survey_id] = {'TXT': [], 'AUD': [], 'VID': []}
-                
-                # Process text submissions
-                col_submissions = 0
-                for idx, text_value in df[col].items():
-                    if pd.notna(text_value) and str(text_value).strip():
-                        submissions_by_question[base_question][survey_id]['TXT'].append({
-                            'file': f"text_{idx}",
-                            'transcript': str(text_value).strip(),
-                            'score': 100,
-                            'flag': "no",
-                            'path': f"data_file_{idx}"
-                        })
-                        col_submissions += 1
-                        text_submissions_found += 1
-                
-                print(f"     * Found {col_submissions} text submissions for {base_question}")
-            else:
-                print(f"     * Question {base_question} not in QUESTION_TEXT_MAP, skipping")
+            # Initialize if needed
+            if base_question not in submissions_by_question:
+                submissions_by_question[base_question] = {}
+            if survey_id not in submissions_by_question[base_question]:
+                submissions_by_question[base_question][survey_id] = {'TXT': [], 'AUD': [], 'VID': []}
+            
+            # Process text submissions
+            col_submissions = 0
+            for idx, text_value in df[col].items():
+                if pd.notna(text_value) and str(text_value).strip():
+                    submissions_by_question[base_question][survey_id]['TXT'].append({
+                        'file': f"text_{idx}",
+                        'transcript': str(text_value).strip(),
+                        'score': 100,
+                        'flag': "no",
+                        'path': f"data_file_{idx}"
+                    })
+                    col_submissions += 1
+                    text_submissions_found += 1
+            
+            print(f"     * Found {col_submissions} text submissions for {base_question}")
                 
     except Exception as e:
         print(f"❌ Error processing {excel_path}: {e}")
@@ -449,20 +540,8 @@ if results_df.empty:
 
 # 12) for each survey, merge into its data file and collect trimmed DataFrames
 for survey_id in results_df["survey_id"].unique():
-    # Find data file (may be in subfolder)
-    data_file = None
-    survey_id_str = str(survey_id)
-    
-    # Search for data file in DATA_FILES_ROOT and subdirectories
-    for root, dirs, files in os.walk(DATA_FILES_ROOT):
-        for file in files:
-            if file.endswith('.xlsx') and not file.startswith('~') and not file.endswith('_Transcribed.xlsx'):
-                if survey_id_str in file or survey_id_str in root:
-                    data_file = os.path.join(root, file)
-                    break
-        if data_file:
-            break
-    
+    # Use the previously discovered data file
+    data_file = SURVEY_TO_DATAFILE.get(str(survey_id))
     if not data_file:
         print(f"⚠️ No data file for survey {survey_id}, skipping merge.")
         continue
@@ -477,7 +556,9 @@ for survey_id in results_df["survey_id"].unique():
     # Key: filename (without extension), Value: {transcript, score, flag}
     lookup_dict = {}
     
-    for qlabel in QUESTION_TEXT_MAP.keys():
+    # Build the set of qlabels from the data file (dynamic) to drive merging
+    qlabels = SURVEY_TO_BASES.get(str(survey_id)) or discover_base_questions_in_datafile(data_file)
+    for qlabel in qlabels:
         lookup_dict[qlabel] = {}
         
         # Get all transcriptions for this question
@@ -498,7 +579,7 @@ for survey_id in results_df["survey_id"].unique():
     # Now process each question and add merged columns using VLOOKUP approach
     columns_added = 0
     
-    for qlabel in QUESTION_TEXT_MAP.keys():
+    for qlabel in qlabels:
         # Create merged column
         merged_col = f"{qlabel}_Merged"
         score_col = f"{qlabel}_Merged_Score"
@@ -570,7 +651,7 @@ for survey_id in results_df["survey_id"].unique():
         new_column_order.append(col)
         
         # After each question's last column, insert merged columns
-        for qlabel in QUESTION_TEXT_MAP.keys():
+        for qlabel in qlabels:
             vid_c2_col = f"{qlabel}_VIDc2"
             aud_c2_col = f"{qlabel}_AUDc2"
             txt_col = f"{qlabel}_TXT"
@@ -600,9 +681,9 @@ for survey_id in results_df["survey_id"].unique():
     base_df['survey_id'] = survey_id
 
     # trim to only response related columns and respondents
-    file_cols = [f"{qlabel}_File" for qlabel in QUESTION_TEXT_MAP.keys() if f"{qlabel}_File" in base_df.columns]
+    file_cols = [f"{qlabel}_File" for qlabel in qlabels if f"{qlabel}_File" in base_df.columns]
     q_cols = []
-    for qlabel in QUESTION_TEXT_MAP.keys():
+    for qlabel in qlabels:
         if qlabel in base_df.columns:
             q_cols.extend([qlabel, f"{qlabel}_Score", f"{qlabel}_Flag"])
 
