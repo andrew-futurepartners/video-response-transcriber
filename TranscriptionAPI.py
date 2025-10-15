@@ -1,6 +1,5 @@
 import os
 import warnings
-import whisper
 import openai
 import pandas as pd
 import json
@@ -196,12 +195,37 @@ def discover_base_questions_in_datafile(xlsx_path):
         print(f"❌ Error discovering questions in {os.path.basename(xlsx_path)}: {e}")
     return sorted(bases)
 
-def transcribe_media_file(file_path, model):
-    """Transcribe audio or video file using Whisper"""
+# 1) Using OpenAI Audio API; no local Whisper/ffmpeg setup required
+def transcribe_media_file(file_path, client, model_name="gpt-4o-transcribe", translate_to_english=False, prompt_text=None):
+    """Transcribe (or translate+transcribe) using OpenAI Audio API with 25 MB limit."""
     try:
-        wout = model.transcribe(file_path)
-        return wout["text"].strip()
-    except RuntimeError as e:
+        file_size_bytes = os.path.getsize(file_path)
+        if file_size_bytes > 25 * 1024 * 1024:
+            print(f"⏭️  Skipping (file > 25 MB): {os.path.basename(file_path)}")
+            return "[NO AUDIO]"
+
+        with open(file_path, "rb") as audio_file:
+            if translate_to_english:
+                kwargs = {
+                    "model": model_name,
+                    "file": audio_file,
+                    "response_format": "text",
+                }
+                if prompt_text:
+                    kwargs["prompt"] = prompt_text
+                resp = client.audio.translations.create(**kwargs)
+            else:
+                kwargs = {
+                    "model": model_name,
+                    "file": audio_file,
+                    "response_format": "text",
+                }
+                if prompt_text:
+                    kwargs["prompt"] = prompt_text
+                resp = client.audio.transcriptions.create(**kwargs)
+        # resp is a plain string when response_format='text'
+        return (resp or "").strip()
+    except Exception as e:
         print(f"⚠️ Transcription error for {file_path}: {e}")
         return "[NO AUDIO]"
 
@@ -251,6 +275,49 @@ Instructions:
         print(f"❌ GPT error: {e}")
         return "[GPT ERROR]", 0, "yes"
 
+def postprocess_transcript_with_gpt(transcript, question_context, client, glossary=None):
+    """Lightly correct ASR output: fix obvious errors, punctuation, capitalization, and domain terms.
+    Returns corrected transcript as plain text. Does not paraphrase or add content.
+    """
+    if not transcript or transcript == "[NO AUDIO]":
+        return transcript
+
+    glossary_list = glossary or []
+    glossary_section = "\n".join(f"- {term}" for term in glossary_list) if glossary_list else "(none)"
+
+    system_prompt = (
+        "You are a careful transcript corrector for online survey responses. "
+        "Your goal is to correct automatic speech recognition mistakes while preserving the respondent's voice and meaning. "
+        "Apply these rules strictly:\n"
+        "1) Correct obvious misspellings and word-splitting errors; fix easy homophones if context is clear.\n"
+        "2) Add conventional punctuation and sentence casing.\n"
+        "3) Do NOT rephrase, summarize, or add new content.\n"
+        "4) Keep slang, dialect, and mild filler words if they convey tone; remove only truly extraneous repetitions like 'um um um'.\n"
+        "5) Do not censor or redact.\n"
+        "6) Prefer these exact spellings/capitalization for domain terms (if present):\n"
+        f"{glossary_section}\n"
+        "7) If unsure, prefer the original wording."
+    )
+
+    user_prompt = (
+        "Context about the question: " + str(question_context or "(not provided)") + "\n\n"
+        "Raw transcript to correct:\n" + str(transcript)
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        corrected = resp.choices[0].message.content or ""
+        return corrected.strip() or transcript
+    except Exception:
+        return transcript
+
 # 6) define roots
 VIDEOS_ROOT = "videos"
 DATA_FILES_ROOT = "data files"
@@ -260,9 +327,8 @@ print("📦 Checking for zip files to extract...")
 unzip_all_folders(VIDEOS_ROOT)
 unzip_all_folders(DATA_FILES_ROOT)
 
-# 7) load Whisper model and initialize OpenAI client
-print("🧠 Loading Whisper 'base' model...")
-model = whisper.load_model("base")
+# 7) initialize OpenAI client
+print("🧠 Using OpenAI 'gpt-4o-transcribe' API...")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 8) collect all submissions by question and survey
@@ -297,8 +363,8 @@ for folder in os.listdir(VIDEOS_ROOT):
             if SURVEY_TO_QMAP[survey_id]:
                 try:
                     pairs = [f"{k}: {v}" for k, v in SURVEY_TO_QMAP[survey_id].items()]
-                    joined = ", ".join(pairs)
-                    print(f"📘 Datamap summary for {os.path.basename(data_file_path)} -> {joined}")
+                    joined = "\n   - ".join(pairs)
+                    print(f"📘 Datamap summary for {os.path.basename(data_file_path)}:\n   - {joined}")
                 except Exception as e:
                     print(f"⚠️ Could not print Datamap summary: {e}")
     
@@ -364,24 +430,39 @@ for folder in os.listdir(VIDEOS_ROOT):
         print(f"\n🎬 [{survey_id} - {base_question}_{submission_type}] Processing: {filename}")
         
         if submission_type in ['AUD', 'VID']:
-            # Transcribe audio/video
-            transcript = transcribe_media_file(media_path, model)
+            # Build prompt context using question text if available
+            question_text = get_question_text(survey_id, base_question)
+            if question_text:
+                prompt_text = (
+                    f"The following file is a video or audio submission collected from an online survey "
+                    f"respondent to answer the following question: {question_text}"
+                )
+            else:
+                prompt_text = (
+                    f"The following file is a video or audio submission collected from an online survey respondent "
+                    f"to answer the question labeled {base_question}. Please transcribe clearly with punctuation."
+                )
+            # Transcribe audio/video via OpenAI Audio API with prompt
+            transcript = transcribe_media_file(media_path, client, prompt_text=prompt_text)
             if transcript != "[NO AUDIO]":
+                # Post-process transcript to lightly correct ASR errors
+                corrected_transcript = postprocess_transcript_with_gpt(transcript, question_text or base_question, client)
                 # Score with GPT using dynamic question text, or skip scoring if missing
-                question_text = get_question_text(survey_id, base_question)
                 if not question_text:
-                    clean_transcript = transcript
+                    clean_transcript = corrected_transcript
                     score = 0
                     flag = "no"
                     print(f"🔶 Missing question text for {base_question} (survey {survey_id}); skipping scoring")
                 else:
-                    clean_transcript, score, flag = score_transcript_with_gpt(transcript, question_text, client)
+                    # Use corrected transcript for scoring, keep corrected transcript for output
+                    _ignored_clean, score, flag = score_transcript_with_gpt(corrected_transcript, question_text, client)
+                    clean_transcript = corrected_transcript
             else:
                 clean_transcript, score, flag = transcript, 0, "yes"
         else:
             # For TXT files, we'll handle them separately when processing data files
             clean_transcript = "[TEXT_SUBMISSION]"
-            score = 100  # Text submissions are considered perfect
+            score = 0
             flag = "no"
         
         submissions_by_question[base_question][survey_id][submission_type].append({
@@ -430,11 +511,24 @@ for excel_path in excel_files:
             col_submissions = 0
             for idx, text_value in df[col].items():
                 if pd.notna(text_value) and str(text_value).strip():
+                    raw_text = str(text_value).strip()
+                    # Score TXT responses using GPT when question text is available
+                    question_text = SURVEY_TO_QMAP.get(survey_id, {}).get(base_question)
+                    if question_text:
+                        clean_txt, txt_score, txt_flag = score_transcript_with_gpt(raw_text, question_text, client)
+                        final_text = clean_txt
+                        final_score = txt_score
+                        final_flag = txt_flag
+                    else:
+                        final_text = raw_text
+                        final_score = 0
+                        final_flag = "no"
+
                     submissions_by_question[base_question][survey_id]['TXT'].append({
                         'file': f"text_{idx}",
-                        'transcript': str(text_value).strip(),
-                        'score': 100,
-                        'flag': "no",
+                        'transcript': final_text,
+                        'score': final_score,
+                        'flag': final_flag,
                         'path': f"data_file_{idx}"
                     })
                     col_submissions += 1
@@ -467,6 +561,7 @@ for base_question, surveys in submissions_by_question.items():
                 "survey_id": survey_id,
                 f"{base_question}_File": txt_sub['file'],
                 f"{base_question}_Type": "TXT",
+                "Submission_Method": "Text",
                 base_question: txt_sub['transcript'],
                 f"{base_question}_Score": txt_sub['score'],
                 f"{base_question}_Flag": txt_sub['flag']
@@ -478,6 +573,7 @@ for base_question, surveys in submissions_by_question.items():
                 "survey_id": survey_id,
                 f"{base_question}_File": aud_sub['file'],
                 f"{base_question}_Type": "AUD",
+                "Submission_Method": "Audio",
                 base_question: aud_sub['transcript'],
                 f"{base_question}_Score": aud_sub['score'],
                 f"{base_question}_Flag": aud_sub['flag']
@@ -489,6 +585,7 @@ for base_question, surveys in submissions_by_question.items():
                 "survey_id": survey_id,
                 f"{base_question}_File": vid_sub['file'],
                 f"{base_question}_Type": "VID",
+                "Submission_Method": "Video",
                 base_question: vid_sub['transcript'],
                 f"{base_question}_Score": vid_sub['score'],
                 f"{base_question}_Flag": vid_sub['flag']
@@ -557,7 +654,12 @@ for survey_id in results_df["survey_id"].unique():
     lookup_dict = {}
     
     # Build the set of qlabels from the data file (dynamic) to drive merging
-    qlabels = SURVEY_TO_BASES.get(str(survey_id)) or discover_base_questions_in_datafile(data_file)
+    qlabels_excel = SURVEY_TO_BASES.get(str(survey_id)) or discover_base_questions_in_datafile(data_file)
+    # Failsafe: also include any questions present in submissions (e.g., older implementations)
+    qlabels_from_submissions = set(
+        col[:-5] for col in sub_df.columns if isinstance(col, str) and col.endswith('_File')
+    )
+    qlabels = sorted(set(qlabels_excel or []) | qlabels_from_submissions)
     for qlabel in qlabels:
         lookup_dict[qlabel] = {}
         
@@ -589,12 +691,15 @@ for survey_id in results_df["survey_id"].unique():
         base_df[merged_col] = ""
         base_df[score_col] = 0
         base_df[flag_col] = "no"
+        if 'Submission_Method' not in base_df.columns:
+            base_df['Submission_Method'] = ""
         
         # Process each row
         for idx in range(len(base_df)):
             merged_value = ""
             merged_score = 0
             merged_flag = "no"
+            merged_method = ""
             
             # Check TXT column first
             txt_col = f"{qlabel}_TXT"
@@ -605,6 +710,7 @@ for survey_id in results_df["survey_id"].unique():
                     merged_value = str(txt_value).strip()
                     merged_score = 100  # TXT responses don't have scores
                     merged_flag = "no"
+                    merged_method = "Text"
             
             # Check AUDc1 column if no TXT (use c1 for the code)
             aud_c1_col = f"{qlabel}_AUDc1"
@@ -618,6 +724,7 @@ for survey_id in results_df["survey_id"].unique():
                         merged_value = transcription_data['transcript']
                         merged_score = transcription_data['score']
                         merged_flag = transcription_data['flag']
+                        merged_method = "Audio"
             
             # Check VIDc1 column if no TXT or AUD (use c1 for the code)
             vid_c1_col = f"{qlabel}_VIDc1"
@@ -631,11 +738,15 @@ for survey_id in results_df["survey_id"].unique():
                         merged_value = transcription_data['transcript']
                         merged_score = transcription_data['score']
                         merged_flag = transcription_data['flag']
+                        merged_method = "Video"
             
             # Set the merged values
             base_df.loc[idx, merged_col] = merged_value
             base_df.loc[idx, score_col] = merged_score
             base_df.loc[idx, flag_col] = merged_flag
+            # Set one submission method per respondent row if not already set
+            if merged_method and (not isinstance(base_df.loc[idx, 'Submission_Method'], str) or not str(base_df.loc[idx, 'Submission_Method']).strip()):
+                base_df.loc[idx, 'Submission_Method'] = merged_method
         
         # Check if we added any values
         non_empty = base_df[merged_col].str.strip().ne('').sum()
@@ -645,66 +756,42 @@ for survey_id in results_df["survey_id"].unique():
     
     print(f"   - Total merged columns added: {columns_added}")
     
-    # Insert merged columns in the right positions (after _VIDc2 or _AUDc2 or _TXT)
-    new_column_order = []
-    for col in base_df.columns:
-        new_column_order.append(col)
-        
-        # After each question's last column, insert merged columns
-        for qlabel in qlabels:
-            vid_c2_col = f"{qlabel}_VIDc2"
-            aud_c2_col = f"{qlabel}_AUDc2"
-            txt_col = f"{qlabel}_TXT"
-            
-            # Insert after VIDc2 if it exists, otherwise after AUDc2, otherwise after TXT
-            should_insert = False
-            if col == vid_c2_col:
-                should_insert = True
-            elif vid_c2_col not in base_df.columns and col == aud_c2_col:
-                should_insert = True
-            elif vid_c2_col not in base_df.columns and aud_c2_col not in base_df.columns and col == txt_col:
-                should_insert = True
-            
-            if should_insert:
-                # Insert merged columns here
-                merged_col = f"{qlabel}_Merged"
-                if merged_col in base_df.columns and merged_col not in new_column_order:
-                    new_column_order.append(merged_col)
-                    new_column_order.append(f"{qlabel}_Merged_Score")
-                    new_column_order.append(f"{qlabel}_Merged_Flag")
-    
-    # Reorder columns
+    # Append merged columns at the end to avoid duplicates
+    merged_cols_block = []
+    for qlabel in qlabels:
+        merged_col = f"{qlabel}_Merged"
+        if merged_col in base_df.columns:
+            merged_cols_block.append(merged_col)
+            merged_cols_block.append(f"{qlabel}_Merged_Score")
+            merged_cols_block.append(f"{qlabel}_Merged_Flag")
+
+    non_merged_cols = [c for c in base_df.columns if c not in set(merged_cols_block)]
+    new_column_order = non_merged_cols + merged_cols_block
     base_df = base_df[new_column_order]
-    print(f"   - Reordered columns with merged columns inserted")
+    print(f"   - Reordered columns with merged columns appended at end")
 
     # add survey_id to base_df
     base_df['survey_id'] = survey_id
 
-    # trim to only response related columns and respondents
-    file_cols = [f"{qlabel}_File" for qlabel in qlabels if f"{qlabel}_File" in base_df.columns]
-    q_cols = []
+    # Build respondent-level view using merged columns
+    merged_text_cols = []
+    merged_cols_all = []
     for qlabel in qlabels:
-        if qlabel in base_df.columns:
-            q_cols.extend([qlabel, f"{qlabel}_Score", f"{qlabel}_Flag"])
+        merged_col = f"{qlabel}_Merged"
+        merged_score_col = f"{qlabel}_Merged_Score"
+        merged_flag_col = f"{qlabel}_Merged_Flag"
+        if merged_col in base_df.columns:
+            merged_text_cols.append(merged_col)
+            merged_cols_all.extend([merged_col, merged_score_col, merged_flag_col])
 
-    cols_to_keep = ['survey_id'] + file_cols + q_cols
+    cols_to_keep = ['survey_id', 'Submission_Method'] + merged_cols_all
     available_cols = [col for col in cols_to_keep if col in base_df.columns]
     trimmed_df = base_df[available_cols]
-    
-    # Filter to only rows with responses
-    if file_cols:
-        mask = trimmed_df[file_cols].apply(lambda row: any(val and str(val).strip() for val in row), axis=1)
-        trimmed_df = trimmed_df[mask]
 
-    # save new transcribed data file, do not overwrite original
-    transcribed_file = os.path.join(DATA_FILES_ROOT, f"{survey_id}_Transcribed.xlsx")
-    try:
-        base_df.to_excel(transcribed_file, index=False)
-        print(f"✅ Saved Transcribed File: {os.path.basename(transcribed_file)}")
-    except PermissionError:
-        alt = os.path.join(DATA_FILES_ROOT, f"{survey_id}_Transcribed_copy.xlsx")
-        base_df.to_excel(alt, index=False)
-        print(f"⚠️ File locked, saved to {os.path.basename(alt)}")
+    # Filter to only rows with any merged text present
+    if merged_text_cols:
+        mask = base_df[merged_text_cols].apply(lambda row: any(str(val).strip() for val in row if pd.notna(val)), axis=1)
+        trimmed_df = trimmed_df[mask]
 
     merged_dfs.append(trimmed_df)
 
